@@ -22,9 +22,13 @@ b=$(openssl pkey -in "$KEY" -passin env:IN_PASS -pubout -outform DER | sha256sum
 echo "✅ par cert/chave confere"
 
 # 2) empacota (a cadeia inteira entra: leaf + subCA + root)
+# -iter 600000: o padrao do PKCS#12 e' 2048 iteracoes, KDF dos anos 2000.
+# Se o arquivo vazar, a senha e' a unica barreira - encarecer cada tentativa
+# em ~30x custa 150ms uma vez no startup. Java (keytool/KeyStore) le normal.
 openssl pkcs12 -export \
   -inkey "$KEY" -passin env:IN_PASS \
   -in "$CRT" -name "$ALIAS" \
+  -iter 600000 -macalg sha256 -maciter \
   -out "$OUT" -passout env:OUT_PASS
 chmod 600 "$OUT"
 
@@ -37,3 +41,6 @@ openssl x509 -in <(openssl pkcs12 -in "$OUT" -passin env:OUT_PASS -clcerts -noke
 echo
 echo "secret P12      = base64 -w0 $OUT"
 echo "secret PASSWORD = a senha do p12 que voce acabou de digitar"
+echo
+echo "Use a senha aleatoria que o portal sugere, nao uma memorizavel:"
+echo "o material que o portal entrega usa KDF fraco (SHA-1/3DES, 2048 iter)."

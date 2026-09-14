@@ -97,6 +97,34 @@ Depende do material — e é por isso que confunde:
 `PKCS8EncodedKeySpec` + `EncryptedPrivateKeyInfo`, mas o caminho normal é
 converter para `.p12`.
 
+### Senhas: uma para os dois keystores?
+
+Pode ser a mesma. Os dois arquivos vivem no mesmo cofre, com a mesma ACL — quem
+lê um lê o outro, então senhas distintas não isolam nada. Só vale separar se as
+chaves forem para sistemas ou times diferentes.
+
+O que importa é a **entropia**, porque o KDF é fraco. Inspecionando o material
+que o portal entrega:
+
+```
+p12 do portal   pbeWithSHA1And3-KeyTripleDES-CBC, 2048 iterações, MAC sha1
+.key do portal  pbeWithSHA1And3-KeyTripleDES-CBC, 2048 iterações
+```
+
+SHA-1 + 3DES com 2048 iterações. Se o arquivo vazar, a senha é a única barreira,
+e uma senha memorizável cai em brute force de GPU. Use a aleatória que o portal
+sugere.
+
+No p12 que **você** monta dá para melhorar: o `make-p12.sh` usa
+`-iter 600000 -macalg sha256`, o que encarece cada tentativa em ~30x
+(5 ms → 145 ms). O custo é uma vez, no startup, e `KeyStore`/`keytool` leem
+normalmente.
+
+> Atenção: o zip de credenciais contém **chaves privadas** (a `.key` do mTLS e o
+> p12 da chave de decifragem). O portal só guardou as metades públicas, então
+> esse zip é a única cópia — perdeu, revoga e gera outro. Ele não pertence à
+> pasta de downloads.
+
 ### Preciso da chave de decifragem?
 
 Nem sempre. Vários serviços mTLS cifram só a **request**. Para descobrir, veja

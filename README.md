@@ -1,235 +1,244 @@
-# Mastercard mTLS + JWE — scripts de diagnóstico
+# Mastercard mTLS + JWE
 
-Ferramentas mínimas para integrar com uma API Mastercard que usa **mTLS** e
-**payload encryption (JWE)**, sem depender das bibliotecas Java da Mastercard.
+Scripts para integrar com APIs Mastercard que usam **mTLS** e **payload
+encryption (JWE)**, sem as bibliotecas Java da Mastercard.
 
-Escrito enquanto eu integrava o **Benefit Allocation Service (MTLS)**, mas a
-mecânica vale para qualquer API do portal com `auth_type: MTLS`.
-
-Só precisa de `openssl`, `curl` e Python com a lib `cryptography`.
+Precisa de `openssl`, `curl` e Python com a lib `cryptography`.
 
 ---
 
-## As três camadas
+## Antes de começar: os dois `.p12`
 
-O erro mais comum é tratar isso como uma coisa só. São três, independentes, e
-cada uma falha de um jeito diferente:
+A maior fonte de confusão. São **dois arquivos diferentes**, com papéis diferentes:
 
-```
-1. mTLS            você prova quem é, no handshake TLS
-                   → certificado de cliente + chave privada (keystore .p12)
+| | p12 de **identidade** (mTLS) | p12 de **decifragem** |
+|---|---|---|
+| Para quê | provar quem você é no handshake TLS | decifrar a resposta da API |
+| De onde vem | **você monta** do `.crt` + `.key` | **já vem pronto** no zip do portal |
+| Precisa? | **sempre** | só se a resposta vier cifrada |
 
-2. JWE             o corpo da request vira {"encryptedValue": "<jwe>"}
-                   → certificado público da Mastercard (.pem)
-
-3. Negócio         só aqui a API olha o seu payload
-```
-
-Diagnosticar é descobrir em qual camada você parou:
-
-| Sintoma | Camada |
-|---|---|
-| `alert` no handshake, `INVALID_CLIENT_CERT` | 1 — mTLS |
-| HTTP 500 genérico, "unexpected error" | 2 — o corpo chegou, mas não decifrou |
-| `ReasonCode 57` *Invalid encryption key used* | 2 — cifrou com o certificado errado |
-| Erro de negócio com `ReasonCode` específico | 3 — **a parte técnica está OK** |
-
-Um HTTP 500 virando um erro de negócio é sinal de **progresso**: significa que
-o mTLS passou e o JWE foi decifrado.
+> **"Se eu não uso decrypt, não preciso gerar o p12?"**
+> Precisa sim — o do mTLS, sempre. Sem ele você não conecta.
+> O que você ignora é o **outro** p12, o de decifragem. E esse você nunca gera:
+> ele já vem gerado dentro do zip.
 
 ---
 
-## Formato do JWE
+## O que o portal te entrega
 
-```
-alg = RSA-OAEP-256    envelopa a chave AES com a pública da Mastercard
-enc = A256GCM         cifra o payload com AES-256-GCM
-kid = SHA-256 hex da chave pública (o "Fingerprint" que aparece no dashboard)
-```
+Ao criar o projeto, você baixa um zip com 4 arquivos:
 
-Serialização compacta, cinco partes separadas por ponto, dentro de um campo JSON:
+| Arquivo | O que é | Tem segredo? |
+|---|---|---|
+| `...-signing.crt` | cadeia de certificados do seu cliente mTLS | não |
+| `...-private-key.key` | a chave privada dele, cifrada | **sim** |
+| `...client-encryption-key.pem` | certificado público da Mastercard | não |
+| `...client-signature-verification-key.p12` | seu par de chaves para decifragem | **sim** |
 
-```json
-{"encryptedValue":"<header>.<chave>.<iv>.<ciphertext>.<tag>"}
-```
-
-O `kid` é o jeito mais rápido de confirmar que você está usando o certificado
-certo: ele tem que bater com o fingerprint mostrado no dashboard do projeto.
-O `jwe_encrypt.py` imprime o `kid` em stderr a cada chamada.
+Os dois primeiros são as metades do mesmo par — você junta num `.p12` no Passo 2.
 
 ---
 
-## Credenciais: o que é cada arquivo
+## Passo a passo
 
-O portal entrega materiais diferentes com nomes parecidos. O que importa:
-
-| Material | Contém | Formato | Onde entra |
-|---|---|---|---|
-| Certificado mTLS | cert + **chave privada** | `.crt` + `.key` → vire `.p12` | handshake TLS |
-| Senha | — | texto | abre o `.p12` |
-| Client Encryption Key | só o **certificado público** da Mastercard | `.pem` | cifrar a request |
-| Chave de decifragem | seu par privado | `.p12` | decifrar a resposta (*talvez*) |
-
-### `.p12` não é "outro formato de certificado"
-
-`PKCS#12` é um **container** protegido por senha que guarda certificado **e**
-chave privada juntos. O `.pem` que o portal te dá para o certificado mTLS tem
-só a metade pública — sozinho ele **não faz mTLS**, porque o servidor exige que
-você prove posse da chave privada durante o handshake.
-
-O portal **não entrega um `.p12` pronto** para mTLS: manda `.crt` + `.key`
-cifrada. Você monta:
+### Passo 1 — clonar e preparar
 
 ```bash
-./make-p12.sh cadeia.crt chave.key mtls-client.p12
+git clone https://github.com/Recapi/mastercard-mtls-jwe.git
+cd mastercard-mtls-jwe
+mkdir -p certs          # está no .gitignore
 ```
 
-### Java lê PEM?
+Descompacte o zip do portal dentro de `certs/`.
 
-Depende do material — e é por isso que confunde:
-
-| | PEM serve? |
-|---|---|
-| Client Encryption Key (só público) | **sim** — `EncryptionUtils.loadEncryptionCertificate("...pem")` |
-| Identidade mTLS (cert + chave privada) | **não** — `KeyStore.getInstance("PKCS12")` quer `.p12` |
-
-`KeyStore` não lê chave privada em PEM. Dá para fazer na unha com
-`PKCS8EncodedKeySpec` + `EncryptedPrivateKeyInfo`, mas o caminho normal é
-converter para `.p12`.
-
-### Senhas: uma para os dois keystores?
-
-Pode ser a mesma. Os dois arquivos vivem no mesmo cofre, com a mesma ACL — quem
-lê um lê o outro, então senhas distintas não isolam nada. Só vale separar se as
-chaves forem para sistemas ou times diferentes.
-
-O que importa é a **entropia**, porque o KDF é fraco. Inspecionando o material
-que o portal entrega:
-
-```
-p12 do portal   pbeWithSHA1And3-KeyTripleDES-CBC, 2048 iterações, MAC sha1
-.key do portal  pbeWithSHA1And3-KeyTripleDES-CBC, 2048 iterações
-```
-
-SHA-1 + 3DES com 2048 iterações. Se o arquivo vazar, a senha é a única barreira,
-e uma senha memorizável cai em brute force de GPU. Use a aleatória que o portal
-sugere.
-
-No p12 que **você** monta dá para melhorar: o `make-p12.sh` usa
-`-iter 600000 -macalg sha256`, o que encarece cada tentativa em ~30x
-(5 ms → 145 ms). O custo é uma vez, no startup, e `KeyStore`/`keytool` leem
-normalmente.
-
-> Atenção: o zip de credenciais contém **chaves privadas** (a `.key` do mTLS e o
-> p12 da chave de decifragem). O portal só guardou as metades públicas, então
-> esse zip é a única cópia — perdeu, revoga e gera outro. Ele não pertence à
-> pasta de downloads.
-
-### Preciso da chave de decifragem?
-
-Nem sempre. Vários serviços mTLS cifram só a **request**. Para descobrir, veja
-se a config da sua aplicação registra uma chave de decifragem:
+### Passo 2 — montar o p12 do mTLS
 
 ```bash
-grep -rn "withDecryptionKey" src/
+./make-p12.sh certs/*-signing.crt certs/*-private-key.key certs/mtls-client.p12
 ```
 
-```java
-JweConfigBuilder.aJweEncryptionConfig()
-    .withEncryptionCertificate(cert)
-    .withDecryptionKey(privateKey)         // ← se esta linha não existe,
-    .withEncryptedValueFieldName("encryptedValue")   //   a resposta vem em claro
-    .build();
-```
+Ele pede duas senhas: a da `.key` (que você definiu no portal) e a do `.p12` que
+vai sair. Antes de empacotar, confere que a chave realmente corresponde ao
+certificado — se não corresponder, ele para aí.
 
-Na prática: se a resposta chega sem o campo `encryptedValue`, não há nada para
-decifrar. O `jwe_decrypt.py` detecta isso e só repassa o JSON.
-
----
-
-## Uso
+### Passo 3 — configurar
 
 ```bash
-cp .env.example .env      # preencha; .env está no .gitignore
+cp .env.example .env
 ```
 
-**1. A camada mTLS está de pé?**
+```bash
+MC_BASE_URL='https://mtf.services.mastercard.com/loyalty/benefits'
+MC_P12='certs/mtls-client.p12'
+MC_P12_PASS='a-senha-do-p12'
+MC_ENC_CERT='certs/...client-encryption-key.pem'
+```
+
+Use **aspas simples** — senhas costumam ter `!` e `$`, que o shell interpreta.
+Deixe `MC_DEC_P12` vazio por enquanto (Passo 6 decide se você precisa dele).
+
+### Passo 4 — testar o mTLS isolado
 
 ```bash
 ./handshake.sh
 ```
 
-Mostra se o servidor pede certificado, quais CAs aceita, se a senha abre o seu
-keystore e se o handshake fecha. `Verify return code: 0 (ok)` sem linha `alert`
-= mTLS completo.
+Você quer ver `Verify return code: 0 (ok)` **sem** nenhuma linha `alert`.
+Se falhar aqui, o problema é certificado ou senha — não adianta seguir.
 
-**2. Uma chamada**
+### Passo 5 — fazer uma chamada
 
 ```bash
 ./call.sh POST /card-segments \
   '{"cardNumber":5291070000000000,"segments":[{"code":"SEU_SEGMENTO","effectiveDate":"2026-01-31"}]}'
 ```
 
-**3. Utilitários**
+O script cifra o corpo em JWE, envia por mTLS e imprime a resposta.
+
+### Passo 6 — a resposta veio cifrada?
+
+Olhe o que o Passo 5 devolveu:
+
+- **JSON normal** → acabou. Você não precisa do p12 de decifragem. Ignore-o.
+- **`{"encryptedValue": "..."}`** → preencha no `.env`:
 
 ```bash
-./make-p12.sh cadeia.crt chave.key saida.p12   # monta o keystore, validando o par
-python3 gen_card.py gen 529107 5               # PANs válidos por Luhn
-python3 gen_card.py check 5291070000000898     # valida e mostra o dígito correto
-echo '{"encryptedValue":"..."}' | python3 jwe_decrypt.py chave.p12 'senha'
+MC_DEC_P12='certs/...signature-verification-key.p12'
+MC_DEC_P12_PASS='a-senha-que-voce-definiu-no-portal'
 ```
 
-> Os PANs dos guias de teste da Mastercard nem sempre são Luhn-válidos.
-> `5291070000000898`, por exemplo, não é — o dígito verificador correto é `3`.
+Rode o Passo 5 de novo — agora o `call.sh` decifra sozinho.
+
+No código da sua aplicação, o equivalente é uma linha só:
+
+```java
+JweConfigBuilder.aJweEncryptionConfig()
+    .withEncryptionCertificate(cert)
+    .withDecryptionKey(privateKey)      // ← existe? então usa decrypt
+    .withEncryptedValueFieldName("encryptedValue")
+    .build();
+```
+
+Para conferir num projeto existente: `grep -rn "withDecryptionKey" src/`
+
+---
+
+## Onde cada arquivo entra na aplicação
+
+| Secret | Conteúdo | Formato |
+|---|---|---|
+| `P12` | `mtls-client.p12` do Passo 2 | base64 (`base64 -w0`) |
+| `PASSWORD` | senha do p12 acima | texto |
+| `ENCRIPT` | `...client-encryption-key.pem` | **PEM, não converta** |
+| `DESCRIP` | p12 de decifragem | base64 — só se o Passo 6 pediu |
+
+**Java lê PEM?** Depende do material:
+
+- Encryption key (só público) → **sim**: `EncryptionUtils.loadEncryptionCertificate("...pem")`
+- Identidade mTLS (cert + chave privada) → **não**: `KeyStore.getInstance("PKCS12")` quer `.p12`
+
+`KeyStore` não lê chave privada em PEM. Por isso o Passo 2 existe.
+
+---
+
+## Quando der erro
+
+As três camadas falham de jeitos distintos. O erro diz onde você parou:
+
+| Sintoma | Camada | O que olhar |
+|---|---|---|
+| `alert` no handshake, `INVALID_CLIENT_CERT` | mTLS | certificado, senha, cadeia |
+| HTTP 500 genérico | JWE | corpo chegou mas não decifrou |
+| `ReasonCode 57` *Invalid encryption key* | JWE | cifrou com o `.pem` errado |
+| `ReasonCode` de negócio | — | **a parte técnica está OK** |
+
+Um 500 que vira erro de negócio é **progresso**: mTLS passou e o JWE foi decifrado.
+
+O `jwe_encrypt.py` imprime o `kid` em stderr a cada chamada. Ele tem que bater
+com o *Fingerprint* mostrado no dashboard — é o jeito mais rápido de confirmar
+que você está usando o certificado certo.
 
 ---
 
 ## Sandbox → produção
 
-Três coisas mudam **juntas**, e esquecer a segunda é o erro clássico:
+Três coisas mudam **juntas**:
 
 | | Sandbox / MTF | Produção |
 |---|---|---|
 | Host | `mtf.services.mastercard.com` | `services.mastercard.com` |
 | Certificado mTLS | CN com `-Client-MTF-` | certificado novo |
-| **Client Encryption Key** | um `.pem` | **outro `.pem`** |
+| **Encryption key** | um `.pem` | **outro `.pem`** |
 
-Subir com o encryption key do sandbox passa no mTLS e morre em
-**`ReasonCode 57 — Invalid encryption key used`**. Logar o `kid` na subida pega
-isso em segundos.
+Esquecer o terceiro é o erro clássico: passa no mTLS e morre em
+**`ReasonCode 57`**. Refaça o Passo 2 com o zip novo e troque as duas linhas
+no `.env`.
 
-Se você deixar o portal gerar o par **no navegador**, a chave privada nasce ali
-e o download acontece **uma vez só**. Perdeu, não recupera: revoga e gera outro.
+Se o portal gerar o par **no navegador**, o download acontece **uma vez só**.
+Perdeu, não recupera: revoga e gera outro.
 
 ---
 
-## Achando a documentação
-
-O portal da Mastercard é uma SPA — `curl` na URL da doc devolve página vazia.
-Mas existe versão Markdown de tudo, e um índice `llms.txt` por serviço:
+## Utilitários
 
 ```bash
-curl https://developer.mastercard.com/llms.txt
+python3 gen_card.py gen 529107 5            # PANs válidos por Luhn
+python3 gen_card.py check 5291070000000898  # valida e mostra o dígito correto
+echo '{"encryptedValue":"..."}' | python3 jwe_decrypt.py chave.p12 'senha'
+```
+
+> PANs de guias de teste nem sempre são Luhn-válidos. `5291070000000898`, por
+> exemplo, não é — o dígito correto é `3`.
+
+---
+
+## Referência
+
+### Formato do JWE
+
+```
+alg = RSA-OAEP-256    envelopa a chave AES com a pública da Mastercard
+enc = A256GCM         cifra o payload com AES-256-GCM
+kid = SHA-256 hex da chave pública (o "Fingerprint" do dashboard)
+```
+
+```json
+{"encryptedValue":"<header>.<chave>.<iv>.<ciphertext>.<tag>"}
+```
+
+### Achando a documentação
+
+O portal é uma SPA — `curl` na URL da doc devolve página vazia. Mas existe
+versão Markdown de tudo:
+
+```bash
 curl https://developer.mastercard.com/<servico>/documentation/llms.txt
 curl https://developer.mastercard.com/<servico>/documentation/index.md
 curl https://developer.mastercard.com/<servico>/documentation/api-basics/index.md
 ```
 
-O `llms.txt` do serviço traz o `auth_type` e a URL do OpenAPI spec. No spec,
-`x-mastercard-api-encrypted: true` numa operação significa que o corpo **inteiro**
-precisa ir cifrado.
+O `llms.txt` traz o `auth_type` e a URL do OpenAPI spec. No spec,
+`x-mastercard-api-encrypted: true` significa que o corpo **inteiro** vai cifrado.
 
----
+### Senhas
 
-## Segurança
+Pode usar a mesma nos dois keystores — eles vivem no mesmo cofre com a mesma
+ACL, então senhas distintas não isolam nada.
 
-`.gitignore` bloqueia `*.p12 *.key *.pem *.crt .env senha*`. Nenhum material
-criptográfico deve entrar aqui. Guarde chave privada em cofre de secrets — `.p12`
-é binário, então normalmente vai em base64:
+O que importa é a entropia, porque o KDF do portal é fraco
+(`pbeWithSHA1And3-KeyTripleDES-CBC`, 2048 iterações, MAC sha1). Se o arquivo
+vazar, a senha é a única barreira. Use a aleatória que o portal sugere.
 
-```bash
-base64 -w0 mtls-client.p12
-```
+No p12 que você monta dá para melhorar, e o `make-p12.sh` já faz:
+`-iter 600000 -macalg sha256` encarece cada tentativa em ~30x (5 ms → 145 ms),
+custo pago uma vez no startup.
+
+### Segurança
+
+`.gitignore` bloqueia `*.p12 *.key *.pem *.crt .env senha*`.
+
+O zip do portal contém **chaves privadas sem cópia de recuperação** — ele não
+pertence à pasta de downloads.
 
 ## Licença
 

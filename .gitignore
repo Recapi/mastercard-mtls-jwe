@@ -1,0 +1,12 @@
+# NUNCA versionar material criptografico
+*.p12
+*.pfx
+*.jks
+*.key
+*.pem
+*.crt
+*.cer
+*.b64
+certs/
+.env
+senha*.txt

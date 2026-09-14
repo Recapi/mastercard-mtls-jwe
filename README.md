@@ -123,6 +123,98 @@ Para conferir num projeto existente: `grep -rn "withDecryptionKey" src/`
 
 ---
 
+## Em Java
+
+### Com a biblioteca da Mastercard
+
+Não existe método que você escreve. O `OkHttpJweInterceptor` intercepta a
+resposta, decifra e entrega o JSON já em claro para o client gerado. A única
+alavanca é uma linha na config:
+
+```java
+JweConfig config = JweConfigBuilder.aJweEncryptionConfig()
+        .withEncryptionCertificate(encryptionCertificate)   // cifra a request
+        .withDecryptionKey(privateKey)                      // decifra a resposta
+        .withEncryptedValueFieldName("encryptedValue")
+        .build();
+
+httpClientBuilder.addInterceptor(new OkHttpJweInterceptor(config));
+```
+
+Sem `.withDecryptionKey(...)`, o interceptor só cifra a request e repassa a
+resposta como veio.
+
+### Sem a biblioteca
+
+Se você precisa decifrar na mão, é isto — só `javax.crypto`, sem dependência:
+
+```java
+/** Decifra o conteúdo do campo "encryptedValue" de uma resposta da Mastercard. */
+public static String decrypt(String jwe, PrivateKey privateKey) throws Exception {
+    String[] p = jwe.split("\\.");
+    Base64.Decoder b64 = Base64.getUrlDecoder();
+
+    // 1. desembrulha a chave AES de uso único com a SUA chave privada
+    Cipher rsa = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+    rsa.init(Cipher.DECRYPT_MODE, privateKey, new OAEPParameterSpec(
+            "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
+    SecretKey cek = new SecretKeySpec(rsa.doFinal(b64.decode(p[1])), "AES");
+
+    // 2. decifra o payload. O header em base64url, como veio na wire, é o AAD
+    Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+    aes.init(Cipher.DECRYPT_MODE, cek, new GCMParameterSpec(128, b64.decode(p[2])));
+    aes.updateAAD(p[0].getBytes(StandardCharsets.US_ASCII));
+
+    byte[] ct = b64.decode(p[3]), tag = b64.decode(p[4]);
+    byte[] sealed = ByteBuffer.allocate(ct.length + tag.length).put(ct).put(tag).array();
+    return new String(aes.doFinal(sealed), StandardCharsets.UTF_8);
+}
+```
+
+Carregando a chave privada do `.p12`:
+
+```java
+KeyStore ks = KeyStore.getInstance("PKCS12");
+ks.load(new FileInputStream(p12Path), password.toCharArray());
+String alias = ks.aliases().nextElement();
+PrivateKey pk = (PrivateKey) ks.getKey(alias, password.toCharArray());
+```
+
+> **Armadilha:** o `OAEPParameterSpec` explícito não é opcional. Sem ele o Java
+> usa MGF1 com **SHA-1**, mesmo o nome do algoritmo dizendo SHA-256, e você leva
+> `javax.crypto.BadPaddingException: Padding error in decryption` — erro que não
+> dá nenhuma pista da causa real.
+
+---
+
+## Como descobrir se o seu projeto usa decrypt
+
+Quatro buscas, na ordem:
+
+```bash
+# 1. a aplicação registra chave de decifragem?
+grep -rn "withDecryptionKey" src/
+
+# 2. onde o secret é lido?
+grep -rn "DESCRIP" src/ --include=*.java --include=*.yaml --include=*.properties
+
+# 3. decifragem manual, sem a lib?
+grep -rn "OAEPWithSHA-256AndMGF1Padding\|AES/GCM/NoPadding\|encryptedValue" src/
+```
+
+| Resultado | Significa |
+|---|---|
+| (1) retorna algo | usa decrypt — o secret é necessário |
+| (1) vazio, (3) retorna | decifra na mão — o secret é necessário |
+| (1) e (3) vazios, (2) retorna | o secret é lido e descartado — **secret morto** |
+| tudo vazio | o secret nem é referenciado |
+
+A confirmação definitiva não está no código, e sim na resposta: se ela chega sem
+o campo `encryptedValue`, não há nada para decifrar. O Passo 6 responde isso em
+uma chamada.
+
+---
+
 ## Onde cada arquivo entra na aplicação
 
 | Secret | Conteúdo | Formato |
